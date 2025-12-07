@@ -1,16 +1,18 @@
 """
-Unified Deep Q-Network (DQN) Agent for Unified Ludo Environment.
+Unified Dueling Double DQN Agent for Unified Ludo Environment.
 
 Implements the "Egocentric Physics" approach with:
 - Unified Feature Vector (46 floats for 4 tokens, 28 floats for 2 tokens)
 - Action Masking (Logit Masking) for invalid moves
-- Delta-Progress + Event Impulses + ILA Penalty reward structure
+- Mathematically Sound Anti-Farming reward structure
+- Dueling Double DQN architecture
 
 Key Features:
-1. Direct observation input (no state abstraction conversion needed)
-2. Action masking: Sets invalid action logits to -inf before argmax
-3. Supports both 2-token and 4-token configurations
-4. CPU-optimized architecture
+1. Dueling Architecture: Separates state value V(s) and action advantages A(s,a)
+2. Double DQN: Online network selects action, target network evaluates (reduces overestimation)
+3. Action masking: Sets invalid action logits to -inf before argmax
+4. Supports both 2-token and 4-token configurations
+5. CPU-optimized architecture
 """
 
 import random
@@ -27,14 +29,21 @@ from rl_agent_ludo.utils.state import State
 from rl_agent_ludo.agents.baseAgent import Agent
 
 
-class UnifiedDQNNetwork(nn.Module):
+class UnifiedDuelingDQNNetwork(nn.Module):
     """
-    Neural network for Unified DQN optimized for CPU inference.
+    Dueling Double DQN Network for Unified Ludo Environment.
     
     Architecture:
     - Input: Unified feature vector (28 floats for 2 tokens, 46 floats for 4 tokens)
-    - Hidden layers: Configurable (default: [256, 256, 128] for unified state)
-    - Output: 4 Q-values (one per token)
+    - Hidden layers: Shared feature extractor
+    - Dueling heads:
+      - Value stream: V(s) - 1 output (state value)
+      - Advantage stream: A(s,a) - 4 outputs (action advantages)
+    - Output: Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
+    
+    Double DQN Logic:
+    - Online network selects action: a* = argmax_a Q_online(s', a)
+    - Target network evaluates: Q_target(s', a*)
     
     Optimized for CPU:
     - Layer normalization for stable training
@@ -43,24 +52,28 @@ class UnifiedDQNNetwork(nn.Module):
     """
     
     def __init__(self, input_dim: int, hidden_dims: List[int] = [256, 256, 128], output_dim: int = 4):
-        super(UnifiedDQNNetwork, self).__init__()
+        super(UnifiedDuelingDQNNetwork, self).__init__()
         
-        layers = []
+        # Shared feature extractor
+        shared_layers = []
         prev_dim = input_dim
         
-        # Build hidden layers
         for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(prev_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))  # LayerNorm works with batch size 1
-            layers.append(nn.ReLU())
+            shared_layers.append(nn.Linear(prev_dim, hidden_dim))
+            shared_layers.append(nn.LayerNorm(hidden_dim))
+            shared_layers.append(nn.ReLU())
             prev_dim = hidden_dim
         
-        # Output layer (no activation, raw Q-values)
-        layers.append(nn.Linear(prev_dim, output_dim))
+        self.feature_extractor = nn.Sequential(*shared_layers)
         
-        self.network = nn.Sequential(*layers)
+        # Dueling heads
+        # Value stream: V(s) - estimates state value
+        self.value_head = nn.Linear(prev_dim, 1)
         
-        # Initialize weights (Xavier initialization)
+        # Advantage stream: A(s,a) - estimates action advantages
+        self.advantage_head = nn.Linear(prev_dim, output_dim)
+        
+        # Initialize weights
         self._initialize_weights()
     
     def _initialize_weights(self):
@@ -73,7 +86,7 @@ class UnifiedDQNNetwork(nn.Module):
     
     def forward(self, x: torch.Tensor, action_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass through the network with optional action masking.
+        Forward pass through the dueling network with optional action masking.
         
         Args:
             x: Input tensor of shape (batch_size, input_dim)
@@ -81,9 +94,21 @@ class UnifiedDQNNetwork(nn.Module):
             
         Returns:
             Q-values tensor of shape (batch_size, 4)
+            Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
             If action_mask is provided, invalid actions are set to -inf
         """
-        q_values = self.network(x)  # Shape: (batch_size, 4)
+        # Shared feature extraction
+        features = self.feature_extractor(x)  # Shape: (batch_size, last_hidden_dim)
+        
+        # Value stream: V(s)
+        value = self.value_head(features)  # Shape: (batch_size, 1)
+        
+        # Advantage stream: A(s,a)
+        advantage = self.advantage_head(features)  # Shape: (batch_size, 4)
+        
+        # Combine: Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
+        # This ensures that Q(s,a) = V(s) when advantage is zero
+        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
         
         # Apply action masking: set invalid actions to -inf
         if action_mask is not None:
@@ -96,9 +121,11 @@ class UnifiedDQNNetwork(nn.Module):
 
 class UnifiedDQNAgent(Agent):
     """
-    Unified Deep Q-Network agent for Ludo with Egocentric Physics approach.
+    Unified Dueling Double DQN agent for Ludo with Egocentric Physics approach.
     
     Features:
+    - Dueling Double DQN architecture (V(s) + A(s,a))
+    - Double DQN logic: Online selects, target evaluates (reduces overestimation)
     - Direct observation input (unified feature vector)
     - Action masking (logit masking) for invalid moves
     - Experience replay buffer
@@ -186,9 +213,9 @@ class UnifiedDQNAgent(Agent):
         self.gradient_steps = gradient_steps
         self.input_dim = input_dim
         
-        # Neural networks
-        self.q_network = UnifiedDQNNetwork(input_dim, hidden_dims, output_dim=4).to(self.device)
-        self.target_network = UnifiedDQNNetwork(input_dim, hidden_dims, output_dim=4).to(self.device)
+        # Neural networks (Dueling Double DQN)
+        self.q_network = UnifiedDuelingDQNNetwork(input_dim, hidden_dims, output_dim=4).to(self.device)
+        self.target_network = UnifiedDuelingDQNNetwork(input_dim, hidden_dims, output_dim=4).to(self.device)
         self.target_network.load_state_dict(self.q_network.state_dict())
         self.target_network.eval()  # Target network is always in eval mode
         
@@ -383,12 +410,18 @@ class UnifiedDQNAgent(Agent):
             # Get Q-values for taken actions
             q_values_selected = q_values.gather(1, actions_tensor.unsqueeze(1)).squeeze(1)
             
-            # Compute target Q-values using target network with action masking
+            # Double DQN: Online network selects action, Target network evaluates
             with torch.no_grad():
-                next_q_values = self.target_network(next_obs_tensors, next_action_masks_tensors)  # Shape: (batch_size, 4)
-                # Max Q-value (masking already applied in network, so max is over valid actions)
-                max_next_q = next_q_values.max(1)[0]
-                target_q_values = rewards_tensor + (self.gamma * max_next_q * ~dones_tensor)
+                # Online network selects best action for next state
+                next_q_values_online = self.q_network(next_obs_tensors, next_action_masks_tensors)  # Shape: (batch_size, 4)
+                next_actions = next_q_values_online.argmax(1)  # Shape: (batch_size,)
+                
+                # Target network evaluates the selected action
+                next_q_values_target = self.target_network(next_obs_tensors, next_action_masks_tensors)  # Shape: (batch_size, 4)
+                next_q_values_selected = next_q_values_target.gather(1, next_actions.unsqueeze(1)).squeeze(1)  # Shape: (batch_size,)
+                
+                # Compute target Q-values
+                target_q_values = rewards_tensor + (self.gamma * next_q_values_selected * ~dones_tensor)
             
             # Compute loss
             loss = F.mse_loss(q_values_selected, target_q_values)
@@ -433,7 +466,14 @@ class UnifiedDQNAgent(Agent):
         self.episode_count = checkpoint.get('episode_count', 0)
         self.input_dim = checkpoint.get('input_dim', self.input_dim)
         if 'replay_buffer' in checkpoint:
-            self.replay_buffer = deque(checkpoint['replay_buffer'], maxlen=self.replay_buffer_size)
+            saved_buffer = checkpoint['replay_buffer']
+            saved_buffer_size = len(saved_buffer) if saved_buffer else 0
+            self.replay_buffer = deque(saved_buffer, maxlen=self.replay_buffer_size)
+            # Log replay buffer restoration (can be accessed via return or logging)
+            self._loaded_replay_buffer_size = saved_buffer_size
+        else:
+            # No replay buffer in checkpoint - this is an old checkpoint format
+            self._loaded_replay_buffer_size = 0
 
 
 # Convenience factory functions

@@ -1,11 +1,9 @@
 """
-Unified Ludo Gymnasium Environment.
+Unified Ludo Gymnasium Environment with Potential-Based Reward Shaping (PBRS).
 
 Implements the "Egocentric Physics" approach with:
 - Unified Feature Vector (46 floats for 4 tokens, 28 floats for 2 tokens)
-- Delta-Progress Reward Function
-- Event Impulses (Exit Home, Safe Zone, Kill, Goal, Win)
-- ILA Penalty (Death penalty)
+- Potential-Based Reward Shaping (PBRS) to eliminate farming cycles
 - Action Masking support
 
 Two separate environment classes:
@@ -13,6 +11,8 @@ Two separate environment classes:
 - UnifiedLudoEnv4Tokens: For 4 tokens per player (46 floats)
 
 Both support 2 players and 4 players.
+
+Reference: Ng, A. Y., Harada, D., & Russell, S. (1999). Policy invariance under reward transformations.
 """
 from typing import Optional, Tuple, Dict, Any, List
 import numpy as np
@@ -37,7 +37,7 @@ MAX_SCORE_4_TOKENS = 400.0  # 4 tokens * 100 (goal) = 400
 
 class _UnifiedLudoEnvBase(gym.Env):
     """
-    Unified Ludo Environment with Egocentric Physics approach.
+    Unified Ludo Environment with Potential-Based Reward Shaping (PBRS).
     
     State Representation:
     - Global Context (10 floats): Dice One-Hot (6) + Normalized Scores (4)
@@ -45,10 +45,16 @@ class _UnifiedLudoEnvBase(gym.Env):
     
     Total: 10 + (9 × N) floats where N = tokens_per_player
     
-    Reward Function:
-    - Delta-Progress: Continuous gradient for forward movement
-    - Event Impulses: Discrete rewards for key events
-    - ILA Penalty: Death penalty for loss aversion
+    Reward Function (PBRS):
+    - Sparse Rewards: Win (+100.0), Loss (-10.0)
+    - Semantic Rewards: Kill (+10.0), Goal Token (+20.0)
+    - Potential-Based Shaping: F = γ * Φ(s') - Φ(s)
+      where Φ(s) = W_PROG * Progress + W_SAFE * Safety
+    
+    PBRS eliminates farming cycles by design (Ng et al., 1999).
+    The potential function provides dense guidance while preserving optimal policy.
+    
+    Reference: Ng, A. Y., Harada, D., & Russell, S. (1999). Policy invariance under reward transformations.
     """
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
@@ -60,6 +66,7 @@ class _UnifiedLudoEnvBase(gym.Env):
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
         max_score: float = 400.0,
+        gamma: float = 0.99,  # Discount factor for PBRS calculation
     ) -> None:
         super().__init__()
 
@@ -73,6 +80,7 @@ class _UnifiedLudoEnvBase(gym.Env):
         self.render_mode = render_mode
         self._seed = seed
         self.max_score = max_score
+        self.gamma = gamma  # Discount factor for PBRS calculation
 
         # Action space: Discrete(4) for token selection
         self.action_space = spaces.Discrete(4)
@@ -89,7 +97,7 @@ class _UnifiedLudoEnvBase(gym.Env):
         self.current_dice: int = 1
         self._last_raw_obs: Optional[Tuple] = None
         self._prev_state: Optional[State] = None
-        self._prev_progress: Optional[np.ndarray] = None  # Track progress for delta calculation
+        # Note: We don't store _prev_progress anymore - we calculate potential statelessly
 
     def _set_seed(self, seed: Optional[int]) -> None:
         """Set random seed."""
@@ -343,15 +351,61 @@ class _UnifiedLudoEnvBase(gym.Env):
                 score += pos
         return score
 
-    # ---------- Reward Function: Delta-Progress + Event Impulses + ILA Penalty ----------
+    # ---------- PBRS Reward Function ----------
+    
+    # Sparse Rewards (The "True" Objective)
+    WIN_REWARD = 100.0  # Standardized to 100
+    LOSS_PENALTY = -10.0  # Minor penalty for losing to encourage shorter games if losing
+    
+    # Semantic Rewards (Events that are unambiguously good/bad)
+    KILL_REWARD = 10.0  # Killing is always good (tempo swing)
+    GOAL_TOKEN_REWARD = 20.0  # Banking a token is always good
+    
+    # PBRS Weights
+    # Potential = W_PROG * Progress + W_SAFE * Safety
+    # Scale: Progress (0-1) * 100 ~ 100. Safety (0-1) * 20 ~ 20.
+    W_PROGRESS = 50.0  # High weight to drive forward motion
+    W_SAFE = 10.0  # Moderate weight to prefer safe spots
+
+    def _calculate_potential(self, state: State) -> float:
+        """
+        Calculate the Potential Phi(s) of a state.
+        
+        Phi(s) = W_PROG * Sum(Progress) + W_SAFE * Sum(IsSafe)
+        
+        This is computed statelessly from the state object to ensure robustness.
+        """
+        # 1. Progress Potential
+        total_progress = 0.0
+        for i in range(self.tokens_per_player):
+            pos = state.player_pieces[i]
+            # normalized progress is 0.0 to 1.0
+            total_progress += self._get_normalized_progress(pos)
+        
+        progress_potential = total_progress * self.W_PROGRESS
+        
+        # 2. Safety Potential
+        # Count tokens on globes or stars
+        safe_count = 0
+        for i in range(self.tokens_per_player):
+            pos = state.player_pieces[i]
+            if pos in GLOBE_INDEXES or pos in STAR_INDEXES:
+                safe_count += 1
+        
+        safety_potential = safe_count * self.W_SAFE
+        
+        return progress_potential + safety_potential
 
     def _compute_reward_and_done(
         self, prev_state: Optional[State], current_state: State, action: int
     ) -> Tuple[float, bool]:
         """
-        Compute reward using Delta-Progress + Event Impulses + ILA Penalty.
+        Compute PBRS reward + Sparse Rewards.
         
-        Formula: R_total = R_delta + R_impulse + R_penalty
+        Reward = R_sparse + (gamma * Phi(s') - Phi(s))
+        
+        This implementation is stateless - potentials are calculated on the fly
+        from state objects to ensure mathematical consistency.
         """
         if self.game is None:
             return 0.0, False
@@ -359,82 +413,51 @@ class _UnifiedLudoEnvBase(gym.Env):
         winners = self.game.get_winners_of_game()
         done = len(winners) > 0
         
-        # Terminal rewards
+        # 1. Terminal Rewards (Sparse)
         if done:
             if self.player_id in winners:
-                return 100.0, True  # Win impulse
+                return self.WIN_REWARD, True
             else:
-                return -50.0, True  # Loss penalty
+                return self.LOSS_PENALTY, True
         
-        # Skip reward calculation if not our turn
+        # Skip if not our turn
         if prev_state is None or prev_state.current_player != self.player_id:
-            return 0.0, False
-        
-        # Check if action is valid
-        if action >= len(prev_state.player_pieces):
             return 0.0, False
         
         reward = 0.0
         
-        # Calculate progress for delta
-        current_progress = self._get_progress_vector(current_state)
-        if self._prev_progress is not None:
-            prev_progress = self._prev_progress
-        else:
-            prev_progress = self._get_progress_vector(prev_state)
-        
-        # A. Delta-Progress (R_delta)
-        delta_progress = current_progress - prev_progress
-        progress_reward = np.sum(delta_progress) * 2.0  # Scale factor
-        reward += progress_reward
-        
-        # B. Event Impulses (R_impulse)
+        # 2. Semantic Events (Kill & Goal)
         prev_pos = prev_state.player_pieces[action]
         curr_pos = current_state.player_pieces[action]
         
         if prev_pos != curr_pos:
-            # Exit Home (+10.0)
-            if prev_pos == HOME_INDEX and curr_pos != HOME_INDEX:
-                reward += 10.0
-            
-            # Enter Safe Zone (+5.0)
-            if curr_pos in GLOBE_INDEXES and prev_pos not in GLOBE_INDEXES:
-                reward += 5.0
-            if curr_pos in STAR_INDEXES and prev_pos not in STAR_INDEXES:
-                reward += 5.0
-            
-            # Kill Enemy (+15.0)
+            # Kill Check
             captured = False
             for enemy in prev_state.enemy_pieces:
                 for e_pos in enemy:
                     if e_pos == curr_pos and e_pos not in [HOME_INDEX, GOAL_INDEX, 1]:
                         if e_pos not in GLOBE_INDEXES:
-                            reward += 15.0
+                            reward += self.KILL_REWARD
                             captured = True
                             break
                 if captured:
                     break
             
-            # Goal (+30.0)
+            # Goal Check
             if curr_pos == GOAL_INDEX:
-                reward += 30.0
+                reward += self.GOAL_TOKEN_REWARD
         
-        # C. ILA Penalty (R_penalty)
-        # Death Penalty (-20.0) - check if we were captured
-        for i in range(len(prev_state.player_pieces)):
-            p_prev = prev_state.player_pieces[i]
-            p_curr = current_state.player_pieces[i]
-            if p_prev not in [HOME_INDEX, GOAL_INDEX] and p_curr == HOME_INDEX:
-                reward -= 20.0  # Death penalty (on top of negative progress delta)
+        # 3. Potential-Based Reward Shaping (The Anti-Farming Logic)
+        # F = gamma * Phi(s') - Phi(s)
+        # We calculate potentials dynamically here using the state objects
+        current_potential = self._calculate_potential(current_state)
+        prev_potential = self._calculate_potential(prev_state)
+        
+        shaping_reward = (self.gamma * current_potential) - prev_potential
+        reward += shaping_reward
         
         return reward, False
 
-    def _get_progress_vector(self, state: State) -> np.ndarray:
-        """Get progress vector for all tokens."""
-        progress = np.zeros(self.tokens_per_player, dtype=np.float32)
-        for i in range(self.tokens_per_player):
-            progress[i] = self._get_normalized_progress(state.player_pieces[i])
-        return progress
 
     # ---------- Action Masking ----------
 
@@ -469,7 +492,6 @@ class _UnifiedLudoEnvBase(gym.Env):
 
         state = self._build_state_from_obs(raw_obs)
         obs_vec = self._state_to_obs(state)
-        self._prev_progress = self._get_progress_vector(state)
         
         # Action mask
         action_mask = self._get_action_mask(state)
@@ -521,11 +543,8 @@ class _UnifiedLudoEnvBase(gym.Env):
         next_state = self._build_state_from_obs(raw_obs)
         obs_vec = self._state_to_obs(next_state)
 
-        # Compute reward
+        # Compute PBRS reward - Passing both states explicitly
         reward, terminated = self._compute_reward_and_done(prev_state, next_state, action)
-        
-        # Update progress tracking
-        self._prev_progress = self._get_progress_vector(next_state)
         
         # Action mask
         action_mask = self._get_action_mask(next_state)
@@ -551,7 +570,7 @@ class _UnifiedLudoEnvBase(gym.Env):
 
 class UnifiedLudoEnv2Tokens(_UnifiedLudoEnvBase):
     """
-    Unified Ludo Environment for 2 tokens per player.
+    Unified Ludo Environment for 2 tokens per player with PBRS.
     
     Observation Space: 28 floats
     - Global Context (10): Dice One-Hot (6) + Normalized Scores (4)
@@ -567,6 +586,7 @@ class UnifiedLudoEnv2Tokens(_UnifiedLudoEnvBase):
         num_players: int = 4,
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
+        gamma: float = 0.99,  # Discount factor for PBRS
     ) -> None:
         super().__init__(
             player_id=player_id,
@@ -575,12 +595,13 @@ class UnifiedLudoEnv2Tokens(_UnifiedLudoEnvBase):
             render_mode=render_mode,
             seed=seed,
             max_score=MAX_SCORE_2_TOKENS,
+            gamma=gamma,
         )
 
 
 class UnifiedLudoEnv4Tokens(_UnifiedLudoEnvBase):
     """
-    Unified Ludo Environment for 4 tokens per player.
+    Unified Ludo Environment for 4 tokens per player with PBRS.
     
     Observation Space: 46 floats
     - Global Context (10): Dice One-Hot (6) + Normalized Scores (4)
@@ -595,6 +616,7 @@ class UnifiedLudoEnv4Tokens(_UnifiedLudoEnvBase):
         num_players: int = 4,
         render_mode: Optional[str] = None,
         seed: Optional[int] = None,
+        gamma: float = 0.99,  # Discount factor for PBRS
     ) -> None:
         super().__init__(
             player_id=player_id,
@@ -603,5 +625,6 @@ class UnifiedLudoEnv4Tokens(_UnifiedLudoEnvBase):
             render_mode=render_mode,
             seed=seed,
             max_score=MAX_SCORE_4_TOKENS,
+            gamma=gamma,
         )
 

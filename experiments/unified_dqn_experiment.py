@@ -32,7 +32,93 @@ from rl_agent_ludo.environment.unifiedLudoEnv import (
 from rl_agent_ludo.agents.unifiedDQNAgent import (
     create_unified_dqn_agent_2tokens,
     create_unified_dqn_agent_4tokens,
+    UnifiedDQNAgent,
 )
+import torch
+
+
+def _run_greedy_evaluation(
+    agent: UnifiedDQNAgent,
+    env,
+    num_episodes: int = 10,
+    seed: int = 42,
+    verbose: bool = True,
+) -> dict:
+    """
+    Run greedy evaluation episodes with epsilon=0 (no exploration).
+    
+    This reveals the true strength of the current policy without exploration noise.
+    
+    Args:
+        agent: The agent to evaluate
+        env: The environment to evaluate in
+        num_episodes: Number of evaluation episodes
+        seed: Random seed for evaluation
+        verbose: Whether to print progress
+        
+    Returns:
+        Dictionary with evaluation statistics
+    """
+    # Save current epsilon
+    original_epsilon = agent.epsilon
+    
+    # Set epsilon to 0 for greedy evaluation
+    agent.epsilon = 0.0
+    
+    eval_wins = 0
+    eval_rewards = []
+    eval_lengths = []
+    
+    for eval_episode in range(num_episodes):
+        obs, info = env.reset(seed=seed + eval_episode)
+        state = info["state"]
+        action_mask = info["action_mask"]
+        done = False
+        episode_length = 0
+        episode_reward = 0.0
+        
+        max_steps = 10000
+        
+        while not done and episode_length < max_steps:
+            # Greedy action selection (epsilon=0)
+            action = agent.act(state, obs=obs, action_mask=action_mask)
+            
+            obs, reward, terminated, truncated, info = env.step(action)
+            next_state = info["state"]
+            next_action_mask = info["action_mask"]
+            done = terminated or truncated
+            
+            # Don't store experiences or train during evaluation
+            state = next_state
+            action_mask = next_action_mask
+            episode_reward += reward
+            episode_length += 1
+        
+        eval_lengths.append(episode_length)
+        eval_rewards.append(episode_reward)
+        
+        # Check if agent won
+        if done:
+            unwrapped_env = env
+            while hasattr(unwrapped_env, 'env'):
+                unwrapped_env = unwrapped_env.env
+            if hasattr(unwrapped_env, 'game') and unwrapped_env.game:
+                winners = unwrapped_env.game.get_winners_of_game()
+                if hasattr(unwrapped_env, 'player_id') and unwrapped_env.player_id in winners:
+                    eval_wins += 1
+    
+    # Restore original epsilon
+    agent.epsilon = original_epsilon
+    
+    return {
+        "win_rate": eval_wins / num_episodes if num_episodes > 0 else 0.0,
+        "wins": eval_wins,
+        "num_episodes": num_episodes,
+        "avg_reward": float(np.mean(eval_rewards)) if len(eval_rewards) > 0 else 0.0,
+        "std_reward": float(np.std(eval_rewards)) if len(eval_rewards) > 0 else 0.0,
+        "avg_episode_length": float(np.mean(eval_lengths)) if len(eval_lengths) > 0 else 0.0,
+        "std_episode_length": float(np.std(eval_lengths)) if len(eval_lengths) > 0 else 0.0,
+    }
 
 
 def run_experiment(
@@ -55,6 +141,12 @@ def run_experiment(
     gradient_steps: int = 1,  # Single gradient step per training call (optimized for speed)
     hidden_dims: list = [128, 128, 64],  # Smaller network for faster training
     device: str = None,  # 'cuda', 'cpu', or None for auto-detect
+    checkpoint_frequency: int = 10000,  # Save checkpoint every N episodes (0 to disable)
+    save_best_model: bool = True,  # Save best model based on recent win rate
+    best_model_window: int = 1000,  # Episodes to consider for best model (recent win rate)
+    resume_from_checkpoint: str = None,  # Path to checkpoint file to resume from
+    eval_frequency: int = 1000,  # Run greedy evaluation every N episodes (0 to disable)
+    num_eval_episodes: int = 10,  # Number of episodes to run during evaluation
 ) -> dict:
     """
     Run a Unified DQN experiment.
@@ -63,32 +155,53 @@ def run_experiment(
     with action masking and the new reward structure.
     """
     # Create environment based on tokens_per_player
+    # Pass gamma (discount_factor) to environment for PBRS calculation
     if tokens_per_player == 2:
         env = UnifiedLudoEnv2Tokens(
             player_id=0,
             num_players=num_players,
             seed=seed,
+            gamma=discount_factor,  # PBRS requires gamma
         )
     elif tokens_per_player == 4:
         env = UnifiedLudoEnv4Tokens(
             player_id=0,
             num_players=num_players,
             seed=seed,
+            gamma=discount_factor,  # PBRS requires gamma
         )
     else:
         raise ValueError(f"tokens_per_player must be 2 or 4, got {tokens_per_player}")
 
     # Auto-detect device if not specified
     if device is None:
-        import torch
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     if verbose:
         print(f"Using device: {device}")
         if device == 'cuda':
-            import torch
             print(f"GPU: {torch.cuda.get_device_name(0)}")
             print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+    
+    # Checkpointing setup (before agent creation for directory structure)
+    checkpoint_dir = Path(__file__).parent.parent / "checkpoints"
+    checkpoint_dir.mkdir(exist_ok=True)
+    
+    # Create subdirectory based on hyperparameters for organization
+    hyperparam_str = (
+        f"ep{num_episodes//1000}k_"
+        f"lr{learning_rate}_"
+        f"bs{batch_size}_"
+        f"tf{train_frequency}_"
+        f"gs{gradient_steps}_"
+        f"eps{epsilon_schedule}_"
+        f"h{'-'.join(map(str, hidden_dims))}"
+    )
+    run_checkpoint_dir = checkpoint_dir / f"unified_dqn_{tokens_per_player}t_{num_players}p" / hyperparam_str
+    run_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    if verbose and resume_from_checkpoint is None:
+        print(f"Checkpoint directory: {run_checkpoint_dir}")
     
     # Create agent based on tokens_per_player
     # Use epsilon_decay=1.0 to disable automatic decay (we'll use manual scheduling like dqn_selfplay.py)
@@ -124,6 +237,22 @@ def run_experiment(
             device=device,
             seed=seed,
         )
+    
+    # Load checkpoint if resuming (loads agent weights but starts from episode 0)
+    if resume_from_checkpoint and Path(resume_from_checkpoint).exists():
+        if verbose:
+            print(f"Resuming from checkpoint: {resume_from_checkpoint}")
+        agent.load(resume_from_checkpoint)
+        loaded_buffer_size = getattr(agent, '_loaded_replay_buffer_size', 0)
+        current_buffer_size = len(agent.replay_buffer)
+        if verbose:
+            print(f"  Loaded agent state: epsilon={agent.epsilon:.4f}, previous episodes={agent.episode_count}, previous steps={agent.step_count}")
+            if loaded_buffer_size > 0:
+                print(f"  Restored replay buffer: {loaded_buffer_size:,} experiences (current size: {current_buffer_size:,})")
+            else:
+                print(f"  ⚠️  No replay buffer found in checkpoint (old format or empty). Starting with empty buffer.")
+                print(f"  Current replay buffer size: {current_buffer_size:,}")
+            print(f"  Starting training from episode 0 (agent weights preserved)")
 
     wins = 0
     losses = 0
@@ -138,8 +267,27 @@ def run_experiment(
         'replay_buffer_size': [],
     }
     
+    # Periodic stats history (captured at each log interval)
+    periodic_stats_history = []
+    
+    # Evaluation history (greedy evaluation results)
+    eval_history = []
+    
+    # Q-value monitoring
+    q_value_stats = {
+        'mean_q_values': [],
+        'max_q_values': [],
+        'min_q_values': [],
+        'std_q_values': [],
+    }
+    
     # Log every N episodes for debugging (more frequent for better monitoring)
     log_interval = max(1, num_episodes // 50)  # Log ~50 times during training
+    
+    # Best model tracking (using rolling average of evaluations)
+    best_rolling_avg_eval_win_rate = 0.0
+    best_model_path = None
+    rolling_avg_window = 3  # Track rolling average of last 3 evaluations
 
     print(
         f"Running Unified DQN experiment with {num_episodes} episodes "
@@ -147,7 +295,7 @@ def run_experiment(
         f"unified state abstraction)..."
     )
 
-    tqdm_bar = tqdm(total=num_episodes, desc="Running episodes", disable=not verbose)
+    tqdm_bar = tqdm(total=num_episodes, initial=0, desc="Running episodes", disable=not verbose)
 
     for episode in range(num_episodes):
         # Manual epsilon scheduling (optimized for long training runs)
@@ -209,6 +357,23 @@ def run_experiment(
             
             # Select action with masking
             action = agent.act(state, obs=obs, action_mask=action_mask)
+            
+            # Q-value monitoring (sample periodically to avoid overhead)
+            if episode_length % 10 == 0:  # Sample every 10 steps
+                with torch.no_grad():
+                    obs_tensor = torch.from_numpy(obs).float().unsqueeze(0).to(agent.device)
+                    action_mask_tensor = torch.from_numpy(action_mask).bool().unsqueeze(0).to(agent.device)
+                    q_values = agent.q_network(obs_tensor, action_mask_tensor)[0].cpu().numpy()
+                    # Only track valid actions
+                    valid_q_values = q_values[action_mask]
+                    if len(valid_q_values) > 0:
+                        # Skip NaN values (can occur early in training)
+                        valid_q_values_clean = valid_q_values[~np.isnan(valid_q_values)]
+                        if len(valid_q_values_clean) > 0:
+                            q_value_stats['mean_q_values'].append(float(np.mean(valid_q_values_clean)))
+                            q_value_stats['max_q_values'].append(float(np.max(valid_q_values_clean)))
+                            q_value_stats['min_q_values'].append(float(np.min(valid_q_values_clean)))
+                            q_value_stats['std_q_values'].append(float(np.std(valid_q_values_clean)))
 
             obs, reward, terminated, truncated, info = env.step(action)
             next_state = info["state"]
@@ -277,16 +442,43 @@ def run_experiment(
             debug_stats['exploration_rate'].append(agent.epsilon)
             debug_stats['replay_buffer_size'].append(replay_buffer_size)
             
-            # Calculate recent win rate (last 10% of episodes so far)
-            recent_window = max(10, (episode + 1) // 10)
-            recent_wins = sum(debug_stats['win_by_episode'][-recent_window:])
-            recent_win_rate = recent_wins / recent_window if recent_window > 0 else 0.0
+            # Calculate recent win rate (last 10% of episodes so far, but at least 10 episodes)
+            # Ensure we have enough data for accurate recent win rate
+            total_episodes_so_far = len(debug_stats['win_by_episode'])
+            recent_window = max(10, total_episodes_so_far // 10)
+            # Only use episodes we actually have data for
+            recent_window = min(recent_window, total_episodes_so_far)
+            if recent_window > 0:
+                recent_wins = sum(debug_stats['win_by_episode'][-recent_window:])
+                recent_win_rate = recent_wins / recent_window
+            else:
+                recent_win_rate = 0.0
             
             # Calculate recent average reward
             recent_avg_reward = np.mean(debug_stats['reward_by_episode'][-recent_window:]) if recent_window > 0 else 0.0
             
+            # Calculate recent average episode length
+            recent_avg_length = np.mean(episode_lengths[-recent_window:]) if len(episode_lengths) > 0 and recent_window > 0 else 0.0
+            
             # Overall win rate so far
             overall_win_rate = wins / (episode + 1) if episode > 0 else 0.0
+            
+            # Overall average episode length so far
+            overall_avg_length = np.mean(episode_lengths) if len(episode_lengths) > 0 else 0.0
+            
+            # Capture periodic stats at this interval
+            periodic_stats_entry = {
+                "episode": episode + 1,
+                "epsilon": float(agent.epsilon),
+                "replay_buffer_size": int(replay_buffer_size),
+                "recent_win_rate": float(recent_win_rate),
+                "recent_avg_reward": float(recent_avg_reward),
+                "recent_avg_length": float(recent_avg_length),
+                "recent_window_size": int(recent_window),
+                "overall_win_rate": float(overall_win_rate),
+                "overall_avg_length": float(overall_avg_length),
+            }
+            periodic_stats_history.append(periodic_stats_entry)
             
             # Use tqdm.write() to avoid interfering with progress bar
             tqdm.write(
@@ -295,30 +487,157 @@ def run_experiment(
                 f"ε={agent.epsilon:.3f}, "
                 f"Overall win rate={overall_win_rate:.2%}, "
                 f"Recent win rate={recent_win_rate:.2%}, "
-                f"Recent avg reward={recent_avg_reward:.1f}"
+                f"Recent avg reward={recent_avg_reward:.1f}, "
+                f"Recent avg length={recent_avg_length:.1f}, "
+                f"Overall avg length={overall_avg_length:.1f}"
             )
+        
+        # Periodic checkpointing
+        if checkpoint_frequency > 0 and (episode + 1) % checkpoint_frequency == 0:
+            checkpoint_path = run_checkpoint_dir / f"checkpoint_ep{episode+1:06d}_seed{seed}.pth"
+            agent.save(str(checkpoint_path))
+            if verbose:
+                tqdm.write(f"  💾 Checkpoint saved: {checkpoint_path.name}")
+        
+        # Best model tracking and saving (using rolling average of evaluations)
+        # Only save best model if rolling average of last 3 evaluations beats previous best
+        if save_best_model and len(eval_history) >= rolling_avg_window:
+            # Calculate rolling average of last N evaluations
+            recent_evals = eval_history[-rolling_avg_window:]
+            rolling_avg_eval_win_rate = np.mean([e["eval_win_rate"] for e in recent_evals])
+            
+            if rolling_avg_eval_win_rate > best_rolling_avg_eval_win_rate:
+                best_rolling_avg_eval_win_rate = rolling_avg_eval_win_rate
+                # Save best model based on rolling average
+                best_model_path = run_checkpoint_dir / f"best_model_ep{episode+1:06d}_rollingavg{best_rolling_avg_eval_win_rate:.3f}_seed{seed}.pth"
+                agent.save(str(best_model_path))
+                if verbose:
+                    eval_win_rate_strs = [f"{e['eval_win_rate']:.2%}" for e in recent_evals]
+                    tqdm.write(
+                        f"  🏆 Best model saved (rolling avg eval win rate: {best_rolling_avg_eval_win_rate:.2%}, "
+                        f"last {rolling_avg_window} evals: {eval_win_rate_strs}): "
+                        f"{best_model_path.name}"
+                    )
+        # Periodic Greedy Evaluation (epsilon=0)
+        if eval_frequency > 0 and (episode + 1) % eval_frequency == 0:
+            eval_results = _run_greedy_evaluation(
+                agent=agent,
+                env=env,
+                num_episodes=num_eval_episodes,
+                seed=seed + 1000000 + episode,  # Use different seed for evaluation
+                verbose=verbose,
+            )
+            eval_history.append({
+                "episode": episode + 1,
+                "eval_win_rate": eval_results["win_rate"],
+                "eval_avg_reward": eval_results["avg_reward"],
+                "eval_avg_length": eval_results["avg_episode_length"],
+                "num_eval_episodes": num_eval_episodes,
+            })
+            # Calculate rolling average if we have enough evaluations
+            rolling_avg_info = ""
+            if len(eval_history) >= rolling_avg_window:
+                recent_evals = eval_history[-rolling_avg_window:]
+                rolling_avg = np.mean([e["eval_win_rate"] for e in recent_evals])
+                rolling_avg_info = f", Rolling avg ({rolling_avg_window} evals): {rolling_avg:.2%}"
+            
+            if verbose:
+                tqdm.write(
+                    f"  📊 Greedy Eval (ε=0): "
+                    f"Win rate={eval_results['win_rate']:.2%}, "
+                    f"Avg reward={eval_results['avg_reward']:.1f}, "
+                    f"Avg length={eval_results['avg_episode_length']:.1f}"
+                    f"{rolling_avg_info}"
+                )
 
     env.close()
+    
+    # Save final checkpoint
+    final_checkpoint_path = run_checkpoint_dir / f"final_model_ep{num_episodes}_seed{seed}.pth"
+    agent.save(str(final_checkpoint_path))
+    if verbose:
+        print(f"\n  💾 Final checkpoint saved: {final_checkpoint_path}")
+    
+    # Calculate final periodic stats (same as shown in logs)
+    final_replay_buffer_size = len(agent.replay_buffer)
+    final_epsilon = agent.epsilon
+    
+    # Calculate recent stats (last 10% of episodes, same as periodic logs)
+    recent_window = max(10, num_episodes // 10)
+    recent_wins = sum(debug_stats['win_by_episode'][-recent_window:]) if len(debug_stats['win_by_episode']) >= recent_window else sum(debug_stats['win_by_episode'])
+    recent_win_rate = recent_wins / recent_window if recent_window > 0 and len(debug_stats['win_by_episode']) >= recent_window else (wins / num_episodes if num_episodes > 0 else 0.0)
+    
+    recent_avg_reward = float(np.mean(debug_stats['reward_by_episode'][-recent_window:])) if len(debug_stats['reward_by_episode']) >= recent_window else float(np.mean(rewards)) if len(rewards) > 0 else 0.0
+    
+    recent_avg_length = float(np.mean(episode_lengths[-recent_window:])) if len(episode_lengths) >= recent_window else float(np.mean(episode_lengths)) if len(episode_lengths) > 0 else 0.0
+    
+    # Overall stats
+    overall_win_rate = wins / num_episodes if num_episodes > 0 else 0.0
+    overall_avg_length = float(np.mean(episode_lengths)) if len(episode_lengths) > 0 else 0.0
+    
+    # Replay buffer trend
+    replay_buffer_trend = None
+    if debug_stats['replay_buffer_size']:
+        replay_buffer_trend = {
+            "initial": int(debug_stats['replay_buffer_size'][0]),
+            "final": int(debug_stats['replay_buffer_size'][-1])
+        }
     
     # Final debug summary (similar to dqn_selfplay.py)
     if verbose:
         print(f"\n  Debug Summary:")
-        print(f"    Final replay buffer size: {len(agent.replay_buffer)}")
-        print(f"    Final epsilon: {agent.epsilon:.4f}")
-        if debug_stats['replay_buffer_size']:
-            print(f"    Replay buffer trend: {debug_stats['replay_buffer_size'][0]} → {debug_stats['replay_buffer_size'][-1]}")
+        print(f"    Final replay buffer size: {final_replay_buffer_size}")
+        print(f"    Final epsilon: {final_epsilon:.4f}")
+        if replay_buffer_trend:
+            print(f"    Replay buffer trend: {replay_buffer_trend['initial']} → {replay_buffer_trend['final']}")
+        if best_model_path:
+            print(f"    Best model (rolling avg eval win rate: {best_rolling_avg_eval_win_rate:.2%}): {best_model_path.name}")
+        if eval_history:
+            final_eval = eval_history[-1]
+            print(f"    Final greedy eval (ε=0): Win rate={final_eval['eval_win_rate']:.2%}, Avg reward={final_eval['eval_avg_reward']:.1f}")
+        if q_value_stats['mean_q_values']:
+            q_summary = {
+                "mean": np.mean(q_value_stats['mean_q_values']),
+                "max": np.max(q_value_stats['max_q_values']),
+                "min": np.min(q_value_stats['min_q_values']),
+                "std": np.mean(q_value_stats['std_q_values']),
+            }
+            print(f"    Q-value stats: Mean={q_summary['mean']:.2f}, Max={q_summary['max']:.2f}, Min={q_summary['min']:.2f}, Std={q_summary['std']:.2f}")
+        print(f"    Checkpoint directory: {run_checkpoint_dir}")
 
     stats = {
         "num_episodes": num_episodes,
         "wins": wins,
         "losses": losses,
-        "draws": num_episodes - wins - losses,
         "win_rate": wins / num_episodes if num_episodes > 0 else 0.0,
         "avg_episode_length": float(np.mean(episode_lengths)),
-        "std_episode_length": float(np.std(episode_lengths)),
         "avg_reward": float(np.mean(rewards)),
-        "std_reward": float(np.std(rewards)),
-        "debug_stats": debug_stats,  # Include debug stats for analysis
+        # Periodic stats history (captured at each log interval) - essential for tracking progress
+        "periodic_stats_history": periodic_stats_history,
+        # Evaluation history (greedy evaluation with epsilon=0)
+        "eval_history": eval_history,
+        # Q-value monitoring statistics
+        "q_value_stats": {
+            "mean_q_values": q_value_stats['mean_q_values'][-1000:] if len(q_value_stats['mean_q_values']) > 1000 else q_value_stats['mean_q_values'],  # Keep last 1000 samples
+            "max_q_values": q_value_stats['max_q_values'][-1000:] if len(q_value_stats['max_q_values']) > 1000 else q_value_stats['max_q_values'],
+            "min_q_values": q_value_stats['min_q_values'][-1000:] if len(q_value_stats['min_q_values']) > 1000 else q_value_stats['min_q_values'],
+            "std_q_values": q_value_stats['std_q_values'][-1000:] if len(q_value_stats['std_q_values']) > 1000 else q_value_stats['std_q_values'],
+            "summary": {
+                "mean": float(np.mean(q_value_stats['mean_q_values'])) if len(q_value_stats['mean_q_values']) > 0 else None,
+                "max": float(np.max(q_value_stats['max_q_values'])) if len(q_value_stats['max_q_values']) > 0 else None,
+                "min": float(np.min(q_value_stats['min_q_values'])) if len(q_value_stats['min_q_values']) > 0 else None,
+                "std": float(np.mean(q_value_stats['std_q_values'])) if len(q_value_stats['std_q_values']) > 0 else None,
+            } if len(q_value_stats['mean_q_values']) > 0 else None,
+        },
+        # Final periodic stats (for convenience, same as last entry in history)
+        "periodic_stats": {
+            "final_epsilon": float(final_epsilon),
+            "final_replay_buffer_size": int(final_replay_buffer_size),
+            "recent_win_rate": float(recent_win_rate),
+            "recent_avg_reward": float(recent_avg_reward),
+            "recent_avg_length": float(recent_avg_length),
+            "best_rolling_avg_eval_win_rate": float(best_rolling_avg_eval_win_rate) if best_model_path else None,
+        },
         "config": {
             "num_players": num_players,
             "tokens_per_player": tokens_per_player,
@@ -326,7 +645,6 @@ def run_experiment(
             "learning_rate": learning_rate,
             "discount_factor": discount_factor,
             "epsilon": epsilon,
-            "epsilon_decay": epsilon_decay,
             "min_epsilon": min_epsilon,
             "epsilon_schedule": epsilon_schedule,
             "epsilon_decay_fraction": epsilon_decay_fraction,
@@ -337,10 +655,41 @@ def run_experiment(
             "gradient_steps": gradient_steps,
             "hidden_dims": hidden_dims,
             "device": device,
+            "best_model_path": str(best_model_path) if best_model_path else None,
+            "final_checkpoint_path": str(final_checkpoint_path),
         },
     }
 
     return stats
+
+
+def _convert_to_json_serializable(obj):
+    """Recursively convert NumPy types and other non-serializable types to native Python types."""
+    import numpy as np
+    
+    # Check for NumPy integer types (compatible with NumPy 1.x and 2.x)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    # Check for NumPy floating types (compatible with NumPy 1.x and 2.x)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    # Check for NumPy boolean
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    # Check for NumPy arrays
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    # Check for dictionaries
+    elif isinstance(obj, dict):
+        return {key: _convert_to_json_serializable(value) for key, value in obj.items()}
+    # Check for lists and tuples
+    elif isinstance(obj, (list, tuple)):
+        return [_convert_to_json_serializable(item) for item in obj]
+    # Check for Path objects
+    elif isinstance(obj, (Path,)):
+        return str(obj)
+    else:
+        return obj
 
 
 def save_results(results: dict, agent_name: str, base_seed: int):
@@ -363,12 +712,15 @@ def save_results(results: dict, agent_name: str, base_seed: int):
     for config_name, stats in results.items():
         data_to_save["summary"][config_name] = {
             "win_rate": stats["win_rate"],
-            "wins": stats["wins"],
-            "losses": stats["losses"],
-            "draws": stats["draws"],
-            "avg_episode_length": stats["avg_episode_length"],
+            "recent_win_rate": stats.get("periodic_stats", {}).get("recent_win_rate", None),
             "avg_reward": stats["avg_reward"],
+            "recent_avg_reward": stats.get("periodic_stats", {}).get("recent_avg_reward", None),
+            "avg_episode_length": stats["avg_episode_length"],
+            "best_rolling_avg_eval_win_rate": stats.get("periodic_stats", {}).get("best_rolling_avg_eval_win_rate", None),
         }
+    
+    # Convert all NumPy types to native Python types for JSON serialization
+    data_to_save = _convert_to_json_serializable(data_to_save)
 
     with open(filepath_json, "w") as f:
         json.dump(data_to_save, f, indent=2)
@@ -435,13 +787,18 @@ def main(
     train_frequency: int = None,
     gradient_steps: int = None,
     hidden_dims: list = None,
+    checkpoint_frequency: int = 10000,  # Save checkpoint every N episodes (0 to disable)
+    save_best_model: bool = True,  # Save best model based on recent win rate
+    best_model_window: int = 1000,  # Episodes to consider for best model
+    resume_from_checkpoint: str = None,  # Path to checkpoint to resume from
+    eval_frequency: int = 1000,  # Run greedy evaluation every N episodes (0 to disable)
+    num_eval_episodes: int = 10,  # Number of episodes to run during evaluation
 ):
     """Run Unified DQN experiments with specified configuration."""
     agent_name = "UnifiedDQNAgent"
     
     # Auto-detect device if not specified
     if device is None:
-        import torch
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
     # GPU-optimized vs CPU-optimized hyperparameters (if not specified)
@@ -486,6 +843,12 @@ def main(
         gradient_steps=gradient_steps,
         hidden_dims=hidden_dims,
         device=device,
+        checkpoint_frequency=checkpoint_frequency,
+        save_best_model=save_best_model,
+        best_model_window=best_model_window,
+        resume_from_checkpoint=resume_from_checkpoint,
+        eval_frequency=eval_frequency,
+        num_eval_episodes=num_eval_episodes,
     )
 
     # Save results
@@ -499,9 +862,13 @@ def main(
         print(f"  Win Rate: {stats['win_rate']:.2%}")
         print(f"  Wins: {stats['wins']}/{stats['num_episodes']}")
         print(f"  Losses: {stats['losses']}")
-        print(f"  Draws: {stats['draws']}")
-        print(f"  Avg Episode Length: {stats['avg_episode_length']:.1f} ± {stats['std_episode_length']:.1f}")
-        print(f"  Avg Reward: {stats['avg_reward']:.3f} ± {stats['std_reward']:.3f}")
+        print(f"  Avg Episode Length: {stats['avg_episode_length']:.1f}")
+        print(f"  Avg Reward: {stats['avg_reward']:.3f}")
+        if stats.get("periodic_stats", {}).get("recent_win_rate") is not None:
+            print(f"  Recent Win Rate: {stats['periodic_stats']['recent_win_rate']:.2%}")
+            print(f"  Recent Avg Reward: {stats['periodic_stats']['recent_avg_reward']:.1f}")
+        if stats.get("periodic_stats", {}).get("best_rolling_avg_eval_win_rate") is not None:
+            print(f"  Best Rolling Avg Eval Win Rate: {stats['periodic_stats']['best_rolling_avg_eval_win_rate']:.2%}")
 
 
 if __name__ == "__main__":
@@ -533,6 +900,20 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_steps", type=int, default=None, help="Gradient steps per training call (None for auto)")
     parser.add_argument("--hidden_dims", type=str, default="128,128,64", 
                        help="Hidden layer dimensions (comma-separated, e.g., '256,256,128')")
+    parser.add_argument("--checkpoint_frequency", type=int, default=10000,
+                       help="Save checkpoint every N episodes (0 to disable, default: 10000)")
+    parser.add_argument("--save_best_model", action="store_true", default=True,
+                       help="Save best model based on recent win rate (default: True)")
+    parser.add_argument("--no_save_best_model", dest="save_best_model", action="store_false",
+                       help="Disable saving best model")
+    parser.add_argument("--best_model_window", type=int, default=1000,
+                       help="Episodes to consider for best model evaluation (default: 1000)")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                       help="Path to checkpoint file to resume training from")
+    parser.add_argument("--eval_frequency", type=int, default=1000,
+                       help="Run greedy evaluation every N episodes (0 to disable, default: 1000)")
+    parser.add_argument("--num_eval_episodes", type=int, default=10,
+                       help="Number of episodes to run during greedy evaluation (default: 10)")
     
     args = parser.parse_args()
     
@@ -561,6 +942,12 @@ if __name__ == "__main__":
             train_frequency=args.train_frequency,
             gradient_steps=args.gradient_steps,
             hidden_dims=hidden_dims,
+            checkpoint_frequency=args.checkpoint_frequency,
+            save_best_model=args.save_best_model,
+            best_model_window=args.best_model_window,
+            resume_from_checkpoint=args.resume_from_checkpoint,
+            eval_frequency=args.eval_frequency,
+            num_eval_episodes=args.num_eval_episodes,
         )
         save_results(results, "UnifiedDQNAgent_QuickTest", args.seed)
     else:
@@ -583,5 +970,11 @@ if __name__ == "__main__":
             train_frequency=args.train_frequency,
             gradient_steps=args.gradient_steps,
             hidden_dims=hidden_dims,
+            checkpoint_frequency=args.checkpoint_frequency,
+            save_best_model=args.save_best_model,
+            best_model_window=args.best_model_window,
+            resume_from_checkpoint=args.resume_from_checkpoint,
+            eval_frequency=args.eval_frequency,
+            num_eval_episodes=args.num_eval_episodes,
         )
 
