@@ -177,12 +177,8 @@ RLagentLudo/
 │   │   ├── trajectory_collector.py  # Collect demonstrations
 │   │   ├── trajectory_ranker.py     # Rank trajectories
 │   │   └── reward_network.py        # Learn reward function
-│   └── ludo/                # Core game logic
-├── checkpoints/             # Trained model checkpoints
 ├── results/                 # Evaluation results and plots
 │   └── visualizations/      # Generated PNG plots
-├── docs/                    # Documentation
-├── COMPONENTS_DOCUMENTATION.md  # Detailed component docs
 └── requirements.txt
 ```
 
