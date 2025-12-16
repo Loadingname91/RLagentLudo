@@ -1086,6 +1086,8 @@ for episode in range(num_episodes):
 2. Brown, D., et al. (2019). *Extrapolating Beyond Suboptimal Demonstrations via Inverse Reinforcement Learning from Observations.* (T-REX)
 3. Mnih, V., et al. (2015). *Human-level control through deep reinforcement learning.* (DQN)
 4. Wang, Z., et al. (2016). *Dueling Network Architectures for Deep Reinforcement Learning.*
+5. Mehran Sangrasi's AI-Ludo repository: https://github.com/MehranSangrasi/AI-Ludo
+6. Raffaele Aurucci's Ludo_Game_AI repository: https://github.com/raffaele-aurucci/Ludo_Game_AI/tree/main
 
 **Implementation References**:
 - LudoPy: Base game mechanics
