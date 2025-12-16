@@ -1081,18 +1081,27 @@ for episode in range(num_episodes):
 
 ## References
 
-**Key Papers**:
-1. Ng, A. Y., Harada, D., & Russell, S. (1999). *Policy invariance under reward transformations.* (PBRS theory)
-2. Brown, D., et al. (2019). *Extrapolating Beyond Suboptimal Demonstrations via Inverse Reinforcement Learning from Observations.* (T-REX)
-3. Mnih, V., et al. (2015). *Human-level control through deep reinforcement learning.* (DQN)
-4. Wang, Z., et al. (2016). *Dueling Network Architectures for Deep Reinforcement Learning.*
-5. Mehran Sangrasi's AI-Ludo repository: https://github.com/MehranSangrasi/AI-Ludo
-6. Raffaele Aurucci's Ludo_Game_AI repository: https://github.com/raffaele-aurucci/Ludo_Game_AI/tree/main
+**Academic Papers**:
 
-**Implementation References**:
-- LudoPy: Base game mechanics
-- PyTorch: Neural network framework
-- Gymnasium: RL environment standard
+1. Ng, A. Y., Harada, D., & Russell, S. (1999). Policy invariance under reward transformations: Theory and application to reward shaping. *ICML*.
+
+2. Brown, D., Goo, W., Nagarajan, P., & Niekum, S. (2019). Extrapolating beyond suboptimal demonstrations via inverse reinforcement learning from observations. *ICML*. (T-REX)
+
+3. Mnih, V., Kavukcuoglu, K., Silver, D., Graves, A., Antonoglou, I., Wierstra, D., & Riedmiller, M. (2015). Human-level control through deep reinforcement learning. *Nature*, 518(7540), 529-533. (DQN)
+
+4. Wang, Z., Schaul, T., Hessel, M., Van Hasselt, H., Lanctot, M., & Freitas, N. (2016). Dueling network architectures for deep reinforcement learning. *ICML*.
+
+**Software and Libraries**:
+
+5. Towers, M., et al. (2023). Gymnasium: A standard interface for reinforcement learning environments. https://github.com/Farama-Foundation/Gymnasium
+
+6. PyTorch Team. (2023). PyTorch: An open source machine learning framework. https://pytorch.org/
+
+**Code Repositories**:
+
+7. Sangrasi, M. (n.d.). AI-Ludo. https://github.com/MehranSangrasi/AI-Ludo
+
+8. Aurucci, R. (n.d.). Ludo_Game_AI. https://github.com/raffaele-aurucci/Ludo_Game_AI
 
 ---
 
