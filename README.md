@@ -27,6 +27,12 @@ This project explores the application of deep reinforcement learning to Ludo, a 
 
 This structured approach enables the agent to learn fundamental skills before tackling the full game's strategic depth.
 
+## Article
+
+For a detailed technical walkthrough of the implementation, including egocentric feature engineering, Potential-Based Reward Shaping (PBRS), and Hybrid T-REX, see the full article:
+
+**[How to Train AI to Play Multi-Agent Ludo: A Guide to T-REX and Reward Shaping](https://medium.com/@hiteshbalegar/how-to-train-ai-to-play-multi-agent-ludo-a-guide-to-t-rex-and-reward-shaping-with-deep-q-network-4eab00c63c0f)**
+
 ## Results
 
 ### Win Rates Across All Levels
